@@ -1,22 +1,13 @@
 version: v2beta1
 name: troubleshooting-panel-console-plugin
 
-functions:
-  scale_down_coo: |-
-    kubectl scale --replicas=0 -n ${DEVSPACE_NAMESPACE} deployment/observability-operator
-  scale_up_coo: |-
-    kubectl scale --replicas=1 -n ${DEVSPACE_NAMESPACE} deployment/observability-operator
 # This is a list of `pipelines` that DevSpace can execute (you can define your own)
 pipelines:
   # This is the pipeline for the main command: `devspace dev` (or `devspace run-pipeline dev`)
   dev:
-    run: |-
-      scale_down_coo               # 3. Scale down COO so it doesn't fight over the troubleshooting-panel
-      start_dev app                # 5. Start dev mode "app" (see "dev" section)
+    run: start_dev app # 5. Start dev mode "app" (see "dev" section)
   purge:
-    run: |-
-      stop_dev --all
-      scale_up_coo
+    run: stop_dev --all
 
 # This is a list of `dev` containers that are based on the containers created by your deployments
 dev:
@@ -25,15 +16,24 @@ dev:
     labelSelector:
       # Use the instance selector that COO adds
       app.kubernetes.io/instance: troubleshooting-panel
-    # Replace the container image with this dev-optimized image (allows to skip image building during development)
+    # Replace the container image with this dev-optimized image (skip image building)
     devImage: quay.io/openshift-observability-ui/troubleshooting-panel-console-plugin:devspace
+
+    # Uncomment the following temporarily to force the cluster to pull the image.
+    #
+    # patches:
+    #   - op: replace
+    #     path: spec.containers[0].imagePullPolicy
+    #     value: Always
+
     # Sync files between the local filesystem and the development container
     sync:
       - path: ./web/dist:/opt/app-root/web/dist
         startContainer: true
         printLogs: true
+        waitInitialSync: true
     command: ["make"]
-    args: ["start-devspace-backend", "-FEATURES=agent-navigation"]
-    # Inject a lightweight SSH server into the container (so your IDE can connect to the remote dev env)
+    args: ["start-devspace-backend", "FEATURES=agent-navigation"]
+
     ssh:
       enabled: true
