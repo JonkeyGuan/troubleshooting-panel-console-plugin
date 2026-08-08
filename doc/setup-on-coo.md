@@ -1,101 +1,76 @@
 # Troubleshooting Panel + Lightspeed Setup on COO-Managed Cluster
 
-> Tested on OCP 4.22.8 with COO (Cluster Observability Operator) pre-installed, Lightspeed Operator v1.1.2, and Korrel8r v0.11.6
+> Tested on OCP 4.22.8 with COO v1.5.1, Lightspeed Operator v1.1.2, Korrel8r Operator v0.1.8 (korrel8r v0.12.0)
 
 ## Prerequisites
 
 - OpenShift cluster 4.22+ with COO installed
-- UIPlugin `troubleshooting-panel` already created by COO
+- Korrel8r Operator installed (v0.1.8+, provides korrel8r v0.12.0 with MCP support)
 - `oc` CLI installed, logged in as cluster-admin
+- Helm CLI installed
 - LLM API key with function calling support (MiniMax-M3 or compatible)
 
-## 1. Upgrade Korrel8r to v0.11.6
+## 1. Remove COO-Managed Troubleshooting Panel
 
-COO deploys Korrel8r v0.11.1 which lacks MCP support. Upgrade to v0.11.6:
+COO deploys its own troubleshooting panel via a UIPlugin CR. We need to remove it first to avoid conflicts with our standalone deployment, which uses a custom image with the latest features (e.g. `useOverlay` for OCP 4.22).
 
 ```bash
-# Scale down COO to prevent it from reverting changes
-oc scale deployment observability-operator -n openshift-cluster-observability-operator --replicas=0
+# Delete the COO-managed UIPlugin (this removes COO's troubleshooting panel deployment)
+oc delete uiplugin troubleshooting-panel
 
-# Upgrade korrel8r image
-oc set image deployment/korrel8r -n openshift-cluster-observability-operator \
-  korrel8r=quay.io/korrel8r/korrel8r:0.11.6
+# Remove the console plugin registration if it was added
+oc patch consoles.operator.openshift.io cluster --type=json \
+  -p='[{"op":"remove","path":"/spec/plugins/0"}]' 2>/dev/null || true
 
-# Wait for rollout
-oc rollout status deployment/korrel8r -n openshift-cluster-observability-operator --timeout=60s
+# Verify it's gone
+oc get uiplugin troubleshooting-panel 2>&1  # Should return NotFound
+oc get deployment -A 2>&1 | grep troubleshoot  # Should return nothing
 ```
 
-### 1.1 Grant tokenreviews Permission
+> **Note:** COO will not recreate the UIPlugin automatically. If you want to restore it later, re-create the UIPlugin CR with `spec.type: TroubleshootingPanel`.
 
-Korrel8r v0.11.6 requires `tokenreviews` access for MCP authentication:
+## 2. Configure Korrel8r
+
+The Korrel8r Operator (v0.1.8) deploys korrel8r v0.12.0 which includes MCP support. Install the operator from OperatorHub, then create a Korrel8r CR:
 
 ```bash
 oc apply -f - <<'EOF'
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+apiVersion: korrel8r.openshift.io/v1alpha1
+kind: Korrel8r
 metadata:
-  name: korrel8r-token-review
-rules:
-- apiGroups: ["authentication.k8s.io"]
-  resources: ["tokenreviews"]
-  verbs: ["create"]
+  name: korrel8r
+  namespace: korrel8r
+spec: {}
 EOF
-
-oc create clusterrolebinding korrel8r-token-review-binding \
-  --clusterrole=korrel8r-token-review \
-  --serviceaccount=openshift-cluster-observability-operator:troubleshooting-panel-sa
 ```
 
-### 1.2 Create External Route
+### 2.1 Create External Route
 
 ```bash
-oc create route reencrypt korrel8r --service=korrel8r -n openshift-cluster-observability-operator
+oc create route reencrypt korrel8r --service=korrel8r -n korrel8r
 ```
 
 Verify:
 
 ```bash
-KORREL8R_URL=$(oc get routes/korrel8r -n openshift-cluster-observability-operator -o template='https://{{.spec.host}}')
+KORREL8R_URL=$(oc get routes/korrel8r -n korrel8r -o template='https://{{.spec.host}}')
 TOKEN=$(oc whoami -t)
 curl -sk "$KORREL8R_URL/api/v1alpha1/domains" -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 ```
 
-## 2. Enable Agent Navigation
+## 3. Deploy Troubleshooting Panel (Standalone)
 
-Update the UIPlugin CR to enable agent navigation:
-
-```bash
-oc patch uiplugin troubleshooting-panel --type=merge -p '{
-  "spec": {
-    "troubleshootingPanel": {
-      "enableAgentNavigation": true
-    }
-  }
-}'
-```
-
-> **Note:** COO must be scaled back up briefly to reconcile this change, then scaled down again to preserve the korrel8r upgrade.
+Deploy the troubleshooting panel standalone via Helm chart with a custom image:
 
 ```bash
-# Scale COO up to reconcile
-oc scale deployment observability-operator -n openshift-cluster-observability-operator --replicas=1
-
-# Wait for reconciliation (~30s)
-sleep 30
-oc rollout status deployment/troubleshooting-panel -n openshift-cluster-observability-operator --timeout=60s
-
-# Scale COO back down
-oc scale deployment observability-operator -n openshift-cluster-observability-operator --replicas=0
-
-# Re-upgrade korrel8r (COO reverted it)
-oc set image deployment/korrel8r -n openshift-cluster-observability-operator \
-  korrel8r=quay.io/korrel8r/korrel8r:0.11.6
-oc rollout status deployment/korrel8r -n openshift-cluster-observability-operator --timeout=60s
+# Deploy with Helm
+helm upgrade --install troubleshooting-panel-console-plugin \
+  charts/openshift-console-plugin \
+  -n troubleshooting-panel-console-plugin --create-namespace \
+  --set plugin.image=quay.io/jonkey/troubleshooting-panel-console-plugin:4.22
 ```
 
-### 2.1 Re-enable Console Plugin
-
-COO reconciliation may reset the console plugins list. Re-add if missing:
+### 3.1 Enable Console Plugin
 
 ```bash
 # Check current plugins
@@ -106,9 +81,9 @@ oc patch consoles.operator.openshift.io cluster --type=json \
   -p='[{"op":"add","path":"/spec/plugins/-","value":"troubleshooting-panel-console-plugin"}]'
 ```
 
-## 3. Install OpenShift Lightspeed
+## 4. Install OpenShift Lightspeed
 
-### 3.1 Install Lightspeed Operator
+### 4.1 Install Lightspeed Operator
 
 ```bash
 oc apply -f - <<'EOF'
@@ -148,7 +123,7 @@ oc wait csv -n openshift-lightspeed \
   --for=jsonpath='{.status.phase}'=Succeeded --timeout=300s
 ```
 
-### 3.2 Create LLM API Key Secret
+### 4.2 Create LLM API Key Secret
 
 ```bash
 oc create secret generic minimax-api-key \
@@ -156,10 +131,27 @@ oc create secret generic minimax-api-key \
   -n openshift-lightspeed
 ```
 
-### 3.3 Configure OLSConfig
+### 4.3 Build and Push RAG Knowledge Base (Optional)
+
+Build a custom RAG knowledge base with korrel8r documentation to improve MCP tool call accuracy:
 
 ```bash
-KORREL8R_URL=$(oc get routes/korrel8r -n openshift-cluster-observability-operator -o template='https://{{.spec.host}}')
+git clone https://github.com/JonkeyGuan/korrel8r-rag.git
+cd korrel8r-rag
+
+# Fetch latest korrel8r docs
+./generate-docs.sh
+
+# Build FAISS vector DB and push amd64 image
+./build-and-push.sh quay.io/<your-repo>/korrel8r-rag:latest
+```
+
+> **Note:** The builder stage runs natively on ARM (Apple Silicon), the final image targets `linux/amd64` for OCP. See the [korrel8r-rag](https://github.com/JonkeyGuan/korrel8r-rag) repo for details.
+
+### 4.4 Configure OLSConfig
+
+```bash
+KORREL8R_URL=$(oc get routes/korrel8r -n korrel8r -o template='https://{{.spec.host}}')
 
 oc apply -f - <<EOF
 apiVersion: ols.openshift.io/v1alpha1
@@ -186,6 +178,8 @@ spec:
       approvalType: never
     deployment:
       replicas: 1
+    rag:
+    - image: quay.io/jonkey/korrel8r-rag:latest
   mcpServers:
   - name: korrel8r
     url: ${KORREL8R_URL}/mcp
@@ -199,13 +193,30 @@ EOF
 
 > **maxIterations**: Default is 5, which is too low for complex prompts requiring multiple tool calls. Set to 10 to allow the full tool chain to complete.
 
+> **rag**: The BYO Knowledge feature (Technology Preview) loads the korrel8r FAISS vector DB to provide context for LLM responses. Remove the `rag` section if you skipped step 4.3.
+
 Wait for Lightspeed to be ready:
 
 ```bash
 oc wait olsconfig cluster --for=jsonpath='{.status.overallStatus}'=Ready --timeout=300s -n openshift-lightspeed
 ```
 
-## 4. Create Test Workloads (Optional)
+### 4.5 Verify RAG is Loaded
+
+```bash
+oc logs deployment/lightspeed-app-server -n openshift-lightspeed -c lightspeed-service-api \
+  | grep -i "vector index"
+```
+
+Expected:
+
+```
+Loading vector index #0 from quay.io/jonkey/korrel8r-rag:latest...
+Vector index #0 is loaded.
+All indexes are loaded.
+```
+
+## 5. Create Test Workloads (Optional)
 
 ```bash
 oc create namespace demo-troubleshoot
@@ -267,14 +278,15 @@ spec:
 EOF
 ```
 
-## 5. Verification
+## 6. Verification
 
-### 5.1 Verify Korrel8r MCP Tools
+### 6.1 Verify Korrel8r MCP Tools
 
 After making a query in Lightspeed, check logs:
 
 ```bash
-oc logs deployment/lightspeed-app-server -n openshift-lightspeed --tail=50 | grep "Loaded.*tools"
+oc logs deployment/lightspeed-app-server -n openshift-lightspeed -c lightspeed-service-api \
+  --tail=50 | grep "Loaded.*tools"
 ```
 
 Expected:
@@ -284,19 +296,13 @@ Loaded 24 tools from MCP server 'openshift'
 Loaded 8 tools from MCP server 'korrel8r'
 ```
 
-### 5.2 Verify Signal Correlation Panel
+### 6.2 Verify Signal Correlation Panel
 
 1. Open the OpenShift console
 2. Click **Signal Correlation** in the app launcher (grid icon, top-right)
 3. The troubleshooting panel should open
 
-### 5.3 Verify Agent Navigation
-
-1. In the troubleshooting panel toolbar, click the **AI icon**
-2. Toggle **Agent Navigation ON**
-3. Status should show connected (green)
-
-### 5.4 Test with Lightspeed
+### 6.3 Test with Lightspeed
 
 Open the Lightspeed chat and try:
 
@@ -304,26 +310,12 @@ Open the Lightspeed chat and try:
 find error pod in demo-troubleshoot ns, and show correlated signals and show it in console
 ```
 
-## Key Differences from Standalone Setup
-
-| Aspect | Standalone (setup.md) | COO-Managed (this guide) |
-|--------|----------------------|--------------------------|
-| Korrel8r | Community operator + separate namespace | COO-managed in `openshift-cluster-observability-operator` |
-| Troubleshooting Panel | Helm chart deployment | COO-managed via UIPlugin CR |
-| ConsolePlugin proxy | Manually configured | Auto-configured by COO |
-| TLS | Manual certs | COO manages serving certs |
-| Image override | Direct | Must scale down COO first |
-| Agent Navigation | Env var: `TROUBLESHOOTING_PANEL_CONSOLE_PLUGIN_FEATURES` | UIPlugin CR: `enableAgentNavigation: true` |
-
 ## Known Issues
 
 | Issue | Root Cause | Workaround |
 |-------|-----------|------------|
-| COO reverts korrel8r image | COO reconciliation restores managed resources | Keep COO scaled to 0 |
-| Console plugin disappears after COO reconcile | COO resets console plugins list | Re-add with `oc patch consoles.operator.openshift.io` |
-| `agent-navigation.patch.json` warning in logs | Patch file not included in any image build | Cosmetic only, does not affect functionality |
-| MiniMax-M3 raw XML tool calls | Model limitation for complex tool schemas | Retry the prompt, or use a model with better function calling |
-| `create_neighbors_graph` failures | Model generates incorrect korrel8r query syntax | Retry; results are intermittent |
+| MiniMax-M3 shows `<think>` tags | M3 is a reasoning model that outputs thinking traces | Cosmetic only; tool calling works correctly. Alternative: use MiniMax-Text-01 (no `<think>` but weaker tool calling) |
+| `create_neighbors_graph` failures | Model generates incorrect korrel8r query syntax | Retry; RAG knowledge base improves accuracy |
 
 ## Cleanup
 
@@ -336,16 +328,14 @@ oc delete olsconfig cluster -n openshift-lightspeed
 oc delete subscription lightspeed-operator -n openshift-lightspeed
 oc delete namespace openshift-lightspeed
 
-# Restore COO (reverts korrel8r to default version)
-oc scale deployment observability-operator -n openshift-cluster-observability-operator --replicas=1
+# Remove troubleshooting panel
+helm uninstall troubleshooting-panel-console-plugin -n troubleshooting-panel-console-plugin
+oc delete namespace troubleshooting-panel-console-plugin
 
-# Remove RBAC
-oc delete clusterrolebinding korrel8r-token-review-binding
-oc delete clusterrole korrel8r-token-review
+# Remove korrel8r route
+oc delete route korrel8r -n korrel8r
 
-# Remove route
-oc delete route korrel8r -n openshift-cluster-observability-operator
-
-# Disable agent navigation
-oc patch uiplugin troubleshooting-panel --type=merge -p '{"spec":{"troubleshootingPanel":{"enableAgentNavigation":false}}}'
+# Remove console plugin registration
+oc patch consoles.operator.openshift.io cluster --type=json \
+  -p='[{"op":"test","path":"/spec/plugins","value":["troubleshooting-panel-console-plugin"]},{"op":"remove","path":"/spec/plugins"}]'
 ```
