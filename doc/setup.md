@@ -29,7 +29,7 @@ metadata:
   name: korrel8r
   namespace: openshift-operators
 spec:
-  channel: alpha
+  channel: stable
   name: korrel8r
   source: community-operators
   sourceNamespace: openshift-marketplace
@@ -78,7 +78,7 @@ oc scale deployment korrel8r-controller-manager -n openshift-operators --replica
 
 # Update the image
 oc set image deployment/korrel8r -n korrel8r \
-  korrel8r=quay.io/korrel8r/korrel8r:v0.11.6
+  korrel8r=quay.io/korrel8r/korrel8r:0.11.6
 ```
 
 ### 1.5 Grant tokenreviews Permission
